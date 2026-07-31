@@ -72,6 +72,20 @@ partial class BackendManager
         }
 
         /// <summary>
+        /// Disposes a transaction-owned backend while preserving a failed cleanup for retry.
+        /// </summary>
+        public void DisposeTransactionOwner()
+        {
+            if (disposed)
+                return;
+            if (reuse)
+                throw new InvalidOperationException("A transaction-owned backend cannot be returned to the pool.");
+
+            Backend.Dispose();
+            disposed = true;
+        }
+
+        /// <summary>
         /// Disposes the backend wrapper
         /// </summary>
         public void Dispose()
@@ -172,6 +186,16 @@ partial class BackendManager
         /// The active transaction handle bound to <see cref="transactionBackend"/>.
         /// </summary>
         private IBackendTransaction? transaction;
+        /// <summary>
+        /// A remotely completed transaction handle whose post-terminal cleanup must be retried.
+        /// This state is never rollbackable and is kept separate from <see cref="transaction"/>.
+        /// </summary>
+        private IBackendTransaction? completedTransaction;
+        /// <summary>
+        /// The owner retained until all cleanup for <see cref="completedTransaction"/> succeeds.
+        /// The handle may already be null when only owner disposal remains.
+        /// </summary>
+        private ReclaimableBackend? completedTransactionBackend;
 
         /// <summary>
         /// Creates and runs with an instance of the <see cref="Handler"/> class
@@ -370,6 +394,7 @@ partial class BackendManager
                 await WaitForPendingItemsAsync("download", activeDownloads).ConfigureAwait(false);
 
                 await RollbackActiveTransactionOnShutdownAsync().ConfigureAwait(false);
+                await TryCleanupCompletedTransactionAsync().ConfigureAwait(false);
 
                 // Dispose of any remaining backends across all pooled URLs.
                 DrainBackendPool();
@@ -422,6 +447,10 @@ partial class BackendManager
             if (transaction != null)
                 throw new InvalidOperationException("A backend transaction is already active.");
 
+            var cleanupFailure = await TryCleanupCompletedTransactionAsync().ConfigureAwait(false);
+            if (cleanupFailure != null)
+                throw new InvalidOperationException("Cleanup of the previously completed backend transaction is still pending.", cleanupFailure);
+
             ReclaimableBackend? owner = CreateBackend(op);
             try
             {
@@ -436,10 +465,11 @@ partial class BackendManager
                 owner.PreventReuse();
                 var handle = await transactionalBackend
                     .BeginTransactionAsync(op.TransactionContext, cancellationToken)
-                    .ConfigureAwait(false);
+                    .ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The backend returned a null transaction handle.");
 
                 transactionBackend = owner;
-                transaction = handle ?? throw new InvalidOperationException("The backend returned a null transaction handle.");
+                transaction = handle;
                 owner = null;
                 op.SetComplete(true);
             }
@@ -457,16 +487,14 @@ partial class BackendManager
             // A failed commit leaves the transaction active so the caller can enqueue rollback.
             await handle.CommitAsync(cancellationToken).ConfigureAwait(false);
 
+            // Remote publication is now terminal. Move cleanup to a separate state so a
+            // handle/owner disposal failure can never turn a successful commit into a
+            // rollbackable failure or prevent the matching local database commit.
             transaction = null;
             transactionBackend = null;
-            try
-            {
-                await handle.DisposeAsync().ConfigureAwait(false);
-            }
-            finally
-            {
-                owner.Dispose();
-            }
+            completedTransaction = handle;
+            completedTransactionBackend = owner;
+            await TryCleanupCompletedTransactionAsync().ConfigureAwait(false);
 
             op.SetComplete(true);
         }
@@ -476,6 +504,7 @@ partial class BackendManager
             var handle = transaction ?? throw new InvalidOperationException("No backend transaction is active.");
             var owner = transactionBackend ?? throw new InvalidOperationException("The active backend transaction has no owning backend.");
             Exception? failure = null;
+            var handleDisposed = false;
 
             try
             {
@@ -490,16 +519,21 @@ partial class BackendManager
             {
                 // DisposeAsync is required to retry rollback when the first rollback failed.
                 await handle.DisposeAsync().ConfigureAwait(false);
+                handleDisposed = true;
             }
             catch (Exception ex)
             {
                 failure = failure == null ? ex : new AggregateException(failure, ex);
             }
-            finally
+
+            if (handleDisposed)
             {
                 transaction = null;
                 transactionBackend = null;
-                owner.Dispose();
+                completedTransactionBackend = owner;
+                var cleanupFailure = await TryCleanupCompletedTransactionAsync().ConfigureAwait(false);
+                if (cleanupFailure != null)
+                    failure = failure == null ? cleanupFailure : new AggregateException(failure, cleanupFailure);
             }
 
             if (failure != null)
@@ -512,12 +546,12 @@ partial class BackendManager
         {
             var handle = transaction;
             var owner = transactionBackend;
-            transaction = null;
-            transactionBackend = null;
 
             if (handle == null)
             {
-                owner?.Dispose();
+                transactionBackend = null;
+                if (owner != null)
+                    completedTransactionBackend ??= owner;
                 return;
             }
 
@@ -536,11 +570,48 @@ partial class BackendManager
             }
             catch (Exception ex)
             {
-                Logging.Log.WriteWarningMessage(LOGTAG, "BackendTransactionDisposeError", ex, "Failed to dispose active backend transaction during shutdown: {0}", ex.Message);
+                Logging.Log.WriteWarningMessage(LOGTAG, "BackendTransactionDisposeError", ex, "Failed to dispose active backend transaction during shutdown; cleanup will be retried before the handler is released: {0}", ex.Message);
+                return;
             }
-            finally
+
+            transaction = null;
+            transactionBackend = null;
+            completedTransactionBackend = owner;
+        }
+
+        /// <summary>
+        /// Retries cleanup that follows a terminal backend commit or rollback.
+        /// A failure remains reachable for a later begin or shutdown retry.
+        /// </summary>
+        private async Task<Exception?> TryCleanupCompletedTransactionAsync()
+        {
+            if (completedTransactionBackend == null)
+                return null;
+
+            if (completedTransaction != null)
             {
-                owner?.Dispose();
+                try
+                {
+                    await completedTransaction.DisposeAsync().ConfigureAwait(false);
+                    completedTransaction = null;
+                }
+                catch (Exception ex)
+                {
+                    Logging.Log.WriteWarningMessage(LOGTAG, "CompletedBackendTransactionDisposeError", ex, "Failed to dispose a completed backend transaction; cleanup remains pending: {0}", ex.Message);
+                    return ex;
+                }
+            }
+
+            try
+            {
+                completedTransactionBackend.DisposeTransactionOwner();
+                completedTransactionBackend = null;
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "CompletedBackendTransactionOwnerDisposeError", ex, "Failed to dispose the backend that owned a completed transaction; cleanup remains pending: {0}", ex.Message);
+                return ex;
             }
         }
 
@@ -698,8 +769,16 @@ partial class BackendManager
                     if (!recovered && retries <= maxRetries && retryDelay.Ticks != 0)
                     {
                         var delay = Library.Utility.Utility.GetRetryDelay(retryDelay, retries, retryWithExponentialBackoff);
-                        using var ct = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, context.TaskReader.ProgressToken, context.TaskReader.TransferToken, context.TaskReader.StopToken);
-                        await Task.Delay(delay, ct.Token).ConfigureAwait(false);
+                        using var ct = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, op.CancelToken, context.TaskReader.ProgressToken, context.TaskReader.TransferToken, context.TaskReader.StopToken);
+                        try
+                        {
+                            await Task.Delay(delay, ct.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                        {
+                            op.SetCancelled();
+                            return;
+                        }
                     }
                 }
 
@@ -830,7 +909,15 @@ partial class BackendManager
 
         public void Dispose()
         {
+            if (transaction != null)
+                RollbackActiveTransactionOnShutdownAsync().GetAwaiter().GetResult();
+            if (completedTransactionBackend != null)
+                TryCleanupCompletedTransactionAsync().GetAwaiter().GetResult();
+
             DrainBackendPool();
+
+            if (transaction != null || completedTransactionBackend != null)
+                throw new InvalidOperationException("Backend transaction cleanup did not complete before the handler was released.");
         }
     }
 }

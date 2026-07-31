@@ -40,6 +40,20 @@ using Duplicati.Library.Snapshots.USN;
 namespace Duplicati.Library.Main.Operation
 {
     /// <summary>
+    /// Signals that remote publication succeeded but the matching local database commit failed.
+    /// The committed remote volumes are authoritative and the local database must be recreated.
+    /// </summary>
+    internal sealed class BackendCommittedLocalDatabaseCommitException(Exception innerException)
+        : UserInformationException(
+            "The backend transaction was committed, but the local database could not be finalized. " +
+            "The remote storage is authoritative. Preserve the current database for diagnostics, then " +
+            "recreate the local database from remote storage with the repair command before another backup.",
+            "BackendCommittedLocalDatabaseCommitFailed",
+            innerException)
+    {
+    }
+
+    /// <summary>
     /// The backup handler is the primary function,
     /// which performs a backup of the given sources
     /// to the chosen destination
@@ -568,6 +582,27 @@ namespace Duplicati.Library.Main.Operation
             }
         }
 
+        /// <summary>
+        /// Publishes the backend transaction before the matching local database transaction.
+        /// Once the backend commit succeeds it cannot be compensated, so a local failure is
+        /// converted to an explicit recovery-required outcome.
+        /// </summary>
+        internal static async Task CommitBackendThenLocalAsync(
+            Func<Task> commitBackend,
+            Func<Task> commitLocalDatabase)
+        {
+            await commitBackend().ConfigureAwait(false);
+
+            try
+            {
+                await commitLocalDatabase().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                throw new BackendCommittedLocalDatabaseCommitException(ex);
+            }
+        }
+
         private static Exception BuildException(Exception source, params Task[] tasks)
         {
             if (tasks == null || tasks.Length == 0)
@@ -654,6 +689,9 @@ namespace Duplicati.Library.Main.Operation
                             },
                             m_result.TaskControl.ProgressToken)
                         .ConfigureAwait(false);
+
+                    if (backendTransactionStarted)
+                        database.Transaction.DeferCommits();
                 }
 
                 DateTime? syntheticFilesetTimestamp = null;
@@ -835,16 +873,36 @@ namespace Duplicati.Library.Main.Operation
                             .WaitForEmptyAsync(m_database, m_taskReader.ProgressToken)
                             .ConfigureAwait(false);
 
-                        await database.Transaction
-                            .CommitAsync("CommitFinalizingBackup")
-                            .ConfigureAwait(false);
-
                         if (backendTransactionStarted)
                         {
-                            await backendManager
-                                .CommitTransactionAsync(m_taskReader.ProgressToken)
+                            // Publish the remote transaction before the local database. If remote
+                            // publication fails, disposing the database rolls back every deferred
+                            // local commit and cannot describe volumes that were never published.
+                            try
+                            {
+                                await CommitBackendThenLocalAsync(
+                                    () => backendManager.CommitTransactionAsync(m_taskReader.ProgressToken),
+                                    () => database.Transaction.CommitDeferredAsync(
+                                        "CommitFinalizingBackup",
+                                        restart: true,
+                                        token: m_taskReader.ProgressToken))
+                                    .ConfigureAwait(false);
+                                backendTransactionStarted = false;
+                            }
+                            catch (BackendCommittedLocalDatabaseCommitException)
+                            {
+                                // The remote commit is terminal. Do not attempt a misleading rollback;
+                                // disposal will roll back the stale local transaction and the surfaced
+                                // exception directs the operator to recreate it from remote storage.
+                                backendTransactionStarted = false;
+                                throw;
+                            }
+                        }
+                        else
+                        {
+                            await database.Transaction
+                                .CommitAsync("CommitFinalizingBackup")
                                 .ConfigureAwait(false);
-                            backendTransactionStarted = false;
                         }
 
                         if (await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
