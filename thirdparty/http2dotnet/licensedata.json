@@ -1,0 +1,7 @@
+{
+  "name": "http2dotnet",
+  "description": "HTTP/2 and HPACK protocol implementations for .NET Standard (NuGet packages http2dotnet and http2dotnet.hpack).",
+  "link": "https://github.com/Matthias247/http2dotnet/tree/0.8",
+  "license": "MIT",
+  "notes": "Version 0.8.0; source tag 0.8, commit 4e6ea0f2f148164f1fac75cb4a0664308aa0e330."
+}

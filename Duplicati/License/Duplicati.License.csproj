@@ -118,6 +118,18 @@
       <Link>licenses\FluentFTP\licensedata.json</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="..\..\thirdparty\http2dotnet\Homepage.txt">
+      <Link>licenses\http2dotnet\Homepage.txt</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\..\thirdparty\http2dotnet\license.txt">
+      <Link>licenses\http2dotnet\license.txt</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\..\thirdparty\http2dotnet\licensedata.json">
+      <Link>licenses\http2dotnet\licensedata.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="..\..\thirdparty\jQuery\Homepage.txt">
       <Link>licenses\jQuery\Homepage.txt</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
