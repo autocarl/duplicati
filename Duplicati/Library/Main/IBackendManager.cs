@@ -39,6 +39,27 @@ namespace Duplicati.Library.Main;
 internal interface IBackendManager : IDisposable
 {
     /// <summary>
+    /// Starts an instance-bound backend transaction when the configured backend supports it.
+    /// </summary>
+    /// <param name="context">The immutable transaction metadata.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns><c>true</c> when a transaction was started; <c>false</c> for a legacy backend.</returns>
+    Task<bool> BeginTransactionAsync(BackendTransactionContext context, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Commits the active backend transaction after all preceding queued operations complete.
+    /// </summary>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    Task CommitTransactionAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Rolls back the active backend transaction after all preceding queued operations complete.
+    /// </summary>
+    /// <param name="exception">The failure that caused the rollback, if any.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    Task RollbackTransactionAsync(Exception? exception, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Uploads a block volume to the backend, including an optional index volume
     /// </summary>
     /// <param name="blockVolume">The block volume to upload</param>

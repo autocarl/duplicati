@@ -32,7 +32,10 @@ namespace Duplicati.Library.Main
         QuotaInfo,
         WaitForEmpty,
         SetObjectLock,
-        GetObjectLock
+        GetObjectLock,
+        TransactionBegin,
+        TransactionCommit,
+        TransactionRollback
     }
 
     public enum BackendEventType

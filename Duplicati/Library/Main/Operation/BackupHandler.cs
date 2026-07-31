@@ -619,6 +619,7 @@ namespace Duplicati.Library.Main.Operation
                 .ConfigureAwait(false);
 
             var lastTempVolumeIncomplete = false;
+            var backendTransactionStarted = false;
 
             if (!string.IsNullOrWhiteSpace(lastTempFilelist.Name))
             {
@@ -639,6 +640,21 @@ namespace Duplicati.Library.Main.Operation
                     await database
                         .TerminatedWithActiveUploadsAsync(m_result.TaskControl.ProgressToken, true)
                         .ConfigureAwait(false);
+
+                if (!m_options.Dryrun)
+                {
+                    backendTransactionStarted = await backendManager
+                        .BeginTransactionAsync(
+                            new BackendTransactionContext
+                            {
+                                OperationId = Guid.NewGuid(),
+                                OperationName = OperationMode.Backup.ToString(),
+                                Mode = BackendTransactionMode.ReadWrite,
+                                StartedAtUtc = new DateTimeOffset(database.OperationTimestamp.ToUniversalTime()),
+                            },
+                            m_result.TaskControl.ProgressToken)
+                        .ConfigureAwait(false);
+                }
 
                 DateTime? syntheticFilesetTimestamp = null;
                 await using (m_database = database)
@@ -813,9 +829,23 @@ namespace Duplicati.Library.Main.Operation
 
                     if (!m_options.Dryrun)
                     {
+                        // Every remote mutation, including compact/lock/verification uploads,
+                        // must be complete before an atomic backend can publish the backup.
+                        await backendManager
+                            .WaitForEmptyAsync(m_database, m_taskReader.ProgressToken)
+                            .ConfigureAwait(false);
+
                         await database.Transaction
                             .CommitAsync("CommitFinalizingBackup")
                             .ConfigureAwait(false);
+
+                        if (backendTransactionStarted)
+                        {
+                            await backendManager
+                                .CommitTransactionAsync(m_taskReader.ProgressToken)
+                                .ConfigureAwait(false);
+                            backendTransactionStarted = false;
+                        }
 
                         if (await m_result.TaskControl.ProgressRendevouzAsync().ConfigureAwait(false))
                         {
@@ -837,12 +867,35 @@ namespace Duplicati.Library.Main.Operation
             }
             catch (Exception ex)
             {
-                var aex = BuildException(ex, parallelScanner);
-                Logging.Log.WriteErrorMessage(LOGTAG, "FatalError", ex, "Fatal error");
-                if (aex == ex)
+                Exception failure = BuildException(ex, parallelScanner);
+
+                if (backendTransactionStarted)
+                {
+                    try
+                    {
+                        // Rollback must not inherit an already-cancelled operation token.
+                        await backendManager
+                            .RollbackTransactionAsync(failure, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        failure = new AggregateException(
+                            "The backup failed and its backend transaction could not be rolled back.",
+                            failure,
+                            rollbackException);
+                    }
+                    finally
+                    {
+                        backendTransactionStarted = false;
+                    }
+                }
+
+                Logging.Log.WriteErrorMessage(LOGTAG, "FatalError", failure, "Fatal error");
+                if (ReferenceEquals(failure, ex))
                     throw;
 
-                throw aex;
+                throw failure;
             }
             finally
             {

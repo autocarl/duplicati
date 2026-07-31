@@ -139,6 +139,36 @@ internal partial class BackendManager : IBackendManager
     /// </summary>
     public bool SupportsObjectLocking => supportsObjectLocking.Value;
 
+    /// <inheritdoc />
+    public async Task<bool> BeginTransactionAsync(BackendTransactionContext transactionContext, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(transactionContext);
+
+        // Resolve this before the transaction starts so path translation does not
+        // construct a separate capability-probe instance while a transaction is active.
+        _ = supportsFolderOperations.Value;
+
+        var op = new BeginTransactionOperation(transactionContext, context, cancellationToken);
+        await QueueTaskAsync(op).ConfigureAwait(false);
+        return await op.GetResultAsync().ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task CommitTransactionAsync(CancellationToken cancellationToken)
+    {
+        var op = new CommitTransactionOperation(context, cancellationToken);
+        await QueueTaskAsync(op).ConfigureAwait(false);
+        await op.GetResultAsync().ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task RollbackTransactionAsync(Exception? exception, CancellationToken cancellationToken)
+    {
+        var op = new RollbackTransactionOperation(exception, context, cancellationToken);
+        await QueueTaskAsync(op).ConfigureAwait(false);
+        await op.GetResultAsync().ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Enters a task into the queue for processing.
     /// </summary>

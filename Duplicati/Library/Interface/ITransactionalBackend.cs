@@ -37,7 +37,9 @@ namespace Duplicati.Library.Interface;
 /// A transaction is ambient to the backend instance that creates it. After
 /// <see cref="BeginTransactionAsync"/> succeeds and until the transaction reaches a terminal state,
 /// every inherited <see cref="IBackend"/> operation invoked on that exact instance belongs to the
-/// transaction. Callers must keep using that instance and must serialize its backend operations.
+/// transaction. Callers must keep using that instance. All inherited backend operations,
+/// terminal calls, transaction disposal, and disposal of the owning backend instance must be
+/// serialized with one another. The owning backend must not be disposed before its transaction.
 /// </para>
 /// <para>
 /// Only one transaction may be active on an instance. Implementations must throw
@@ -118,7 +120,10 @@ public enum BackendTransactionMode
 /// Versioned, extensible metadata for a backend transaction.
 /// </summary>
 /// <remarks>
-/// Future contract revisions must remain optional for implementations of version 1.
+/// Future contract revisions must remain optional for implementations of version 1. An
+/// implementation must reject an unsupported <see cref="ContractVersion"/> with
+/// <see cref="NotSupportedException"/> before starting a transaction rather than silently
+/// interpreting newer metadata with older semantics.
 /// </remarks>
 public sealed class BackendTransactionContext
 {

@@ -42,6 +42,15 @@ namespace Duplicati.UnitTest
         {
             public bool SupportsObjectLocking => true;
 
+            public Task<bool> BeginTransactionAsync(BackendTransactionContext context, CancellationToken cancellationToken)
+                => Task.FromResult(false);
+
+            public Task CommitTransactionAsync(CancellationToken cancellationToken)
+                => Task.CompletedTask;
+
+            public Task RollbackTransactionAsync(Exception? exception, CancellationToken cancellationToken)
+                => Task.CompletedTask;
+
             public Task SetObjectLockUntilAsync(string remotename, DateTime lockUntilUtc, CancellationToken cancelToken)
                 => Task.CompletedTask;
 

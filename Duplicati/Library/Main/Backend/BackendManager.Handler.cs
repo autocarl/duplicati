@@ -163,6 +163,15 @@ partial class BackendManager
         /// Whether any files have been downloaded
         /// </summary>
         private bool anyDownloaded;
+        /// <summary>
+        /// The backend instance exclusively owned by the active transaction.
+        /// It is never returned to the ordinary connection pool.
+        /// </summary>
+        private ReclaimableBackend? transactionBackend;
+        /// <summary>
+        /// The active transaction handle bound to <see cref="transactionBackend"/>.
+        /// </summary>
+        private IBackendTransaction? transaction;
 
         /// <summary>
         /// Creates and runs with an instance of the <see cref="Handler"/> class
@@ -303,8 +312,21 @@ partial class BackendManager
                         // Clean up completed uploads, if any
                         await ReclaimCompletedTasksAsync().ConfigureAwait(false);
 
+                        // Transaction control messages form queue barriers. While a
+                        // transaction is active, every backend operation is also a barrier
+                        // so the instance-bound backend is never used concurrently.
+                        if (op is BeginTransactionOperation or CommitTransactionOperation or RollbackTransactionOperation)
+                        {
+                            await EnsureAtMostNActiveTasksAsync(1, 1).ConfigureAwait(false);
+                            await ExecuteTransactionControlAsync(op, tcs.Token).ConfigureAwait(false);
+                        }
+                        else if (transaction != null)
+                        {
+                            await EnsureAtMostNActiveTasksAsync(1, 1).ConfigureAwait(false);
+                            await ExecuteWithRetryAsync(op, tcs.Token).ConfigureAwait(false);
+                        }
                         // Allow PUT operations to be queued, if requested
-                        if (op is PutOperation putOp && !putOp.WaitForComplete)
+                        else if (op is PutOperation putOp && !putOp.WaitForComplete)
                         {
                             // Wait for any active downloads to complete before starting an upload
                             await EnsureAtMostNActiveTasksAsync(maxParallelUploads, 1).ConfigureAwait(false);
@@ -347,8 +369,178 @@ partial class BackendManager
                 await WaitForPendingItemsAsync("upload", activeUploads).ConfigureAwait(false);
                 await WaitForPendingItemsAsync("download", activeDownloads).ConfigureAwait(false);
 
+                await RollbackActiveTransactionOnShutdownAsync().ConfigureAwait(false);
+
                 // Dispose of any remaining backends across all pooled URLs.
                 DrainBackendPool();
+            }
+        }
+
+        /// <summary>
+        /// Executes a transaction control message without the ordinary retry policy.
+        /// Keeping failures on the message task leaves the handler alive so a failed
+        /// commit can be followed by an explicit rollback.
+        /// </summary>
+        private async Task ExecuteTransactionControlAsync(PendingOperationBase op, CancellationToken cancellationToken)
+        {
+            using var token = op is RollbackTransactionOperation
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, op.CancelToken)
+                : CancellationTokenSource.CreateLinkedTokenSource(
+                    cancellationToken,
+                    op.CancelToken,
+                    context.TaskReader.TransferToken);
+
+            try
+            {
+                switch (op)
+                {
+                    case BeginTransactionOperation begin:
+                        await BeginTransactionAsync(begin, token.Token).ConfigureAwait(false);
+                        break;
+                    case CommitTransactionOperation commit:
+                        await CommitTransactionAsync(commit, token.Token).ConfigureAwait(false);
+                        break;
+                    case RollbackTransactionOperation rollback:
+                        await RollbackTransactionAsync(rollback, token.Token).ConfigureAwait(false);
+                        break;
+                    default:
+                        throw new NotSupportedException($"Unsupported transaction control message: {op.GetType().FullName}");
+                }
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                op.SetCancelled();
+            }
+            catch (Exception ex)
+            {
+                op.SetFailed(ex);
+            }
+        }
+
+        private async Task BeginTransactionAsync(BeginTransactionOperation op, CancellationToken cancellationToken)
+        {
+            if (transaction != null)
+                throw new InvalidOperationException("A backend transaction is already active.");
+
+            ReclaimableBackend? owner = CreateBackend(op);
+            try
+            {
+                if (owner.Backend is not ITransactionalBackend transactionalBackend)
+                {
+                    op.SetComplete(false);
+                    return;
+                }
+
+                // A transaction-capable instance carries session state and must never
+                // be returned to the ordinary pool, even after a successful terminal call.
+                owner.PreventReuse();
+                var handle = await transactionalBackend
+                    .BeginTransactionAsync(op.TransactionContext, cancellationToken)
+                    .ConfigureAwait(false);
+
+                transactionBackend = owner;
+                transaction = handle ?? throw new InvalidOperationException("The backend returned a null transaction handle.");
+                owner = null;
+                op.SetComplete(true);
+            }
+            finally
+            {
+                owner?.Dispose();
+            }
+        }
+
+        private async Task CommitTransactionAsync(CommitTransactionOperation op, CancellationToken cancellationToken)
+        {
+            var handle = transaction ?? throw new InvalidOperationException("No backend transaction is active.");
+            var owner = transactionBackend ?? throw new InvalidOperationException("The active backend transaction has no owning backend.");
+
+            // A failed commit leaves the transaction active so the caller can enqueue rollback.
+            await handle.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            transaction = null;
+            transactionBackend = null;
+            try
+            {
+                await handle.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                owner.Dispose();
+            }
+
+            op.SetComplete(true);
+        }
+
+        private async Task RollbackTransactionAsync(RollbackTransactionOperation op, CancellationToken cancellationToken)
+        {
+            var handle = transaction ?? throw new InvalidOperationException("No backend transaction is active.");
+            var owner = transactionBackend ?? throw new InvalidOperationException("The active backend transaction has no owning backend.");
+            Exception? failure = null;
+
+            try
+            {
+                await handle.RollbackAsync(op.Exception, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+
+            try
+            {
+                // DisposeAsync is required to retry rollback when the first rollback failed.
+                await handle.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                failure = failure == null ? ex : new AggregateException(failure, ex);
+            }
+            finally
+            {
+                transaction = null;
+                transactionBackend = null;
+                owner.Dispose();
+            }
+
+            if (failure != null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+
+            op.SetComplete(true);
+        }
+
+        private async Task RollbackActiveTransactionOnShutdownAsync()
+        {
+            var handle = transaction;
+            var owner = transactionBackend;
+            transaction = null;
+            transactionBackend = null;
+
+            if (handle == null)
+            {
+                owner?.Dispose();
+                return;
+            }
+
+            try
+            {
+                await handle.RollbackAsync(null, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "BackendTransactionRollbackError", ex, "Failed to roll back active backend transaction during shutdown: {0}", ex.Message);
+            }
+
+            try
+            {
+                await handle.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logging.Log.WriteWarningMessage(LOGTAG, "BackendTransactionDisposeError", ex, "Failed to dispose active backend transaction during shutdown: {0}", ex.Message);
+            }
+            finally
+            {
+                owner?.Dispose();
             }
         }
 
@@ -476,7 +668,7 @@ partial class BackendManager
                         ||
                         (x is System.Net.Sockets.SocketException sockEx && sockEx.SocketErrorCode == System.Net.Sockets.SocketError.HostNotFound)
                     );
-                    if (dnsFailure)
+                    if (dnsFailure && transaction == null)
                     {
                         try
                         {
@@ -496,7 +688,7 @@ partial class BackendManager
                     var recovered = false;
 
                     // Check if this was a folder missing exception and we are allowed to autocreate folders
-                    if (!(anyDownloaded || anyUploaded) && context.Options.AutocreateFolders && Library.Utility.ExceptionExtensions.FlattenException(ex).Any(x => x is FolderMissingException))
+                    if (transaction == null && !(anyDownloaded || anyUploaded) && context.Options.AutocreateFolders && Library.Utility.ExceptionExtensions.FlattenException(ex).Any(x => x is FolderMissingException))
                     {
                         if (await TryCreateFolderAsync(op).ConfigureAwait(false))
                             recovered = true;
@@ -527,7 +719,7 @@ partial class BackendManager
 
                 // Stop processing tasks if the operation failed and is not being waited for
                 // Delete operations can be retried later, so we don't stop processing
-                if (!op.WaitForComplete && op is not DeleteOperation)
+                if (!op.WaitForComplete && op is not DeleteOperation && transaction == null)
                     System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(lastException).Throw();
             }
         }
@@ -589,15 +781,26 @@ partial class BackendManager
         /// <returns>An awaitable task</returns>
         private async Task ExecuteAsync<TResult>(PendingOperation<TResult> op, CancellationToken cancellationToken)
         {
-            using var backend = CreateBackend(op);
+            ReclaimableBackend? leasedBackend = null;
+            var retainedBackend = transactionBackend;
+
+            if (retainedBackend != null
+                && op.BackendUrlOverride != null
+                && !string.Equals(op.BackendUrlOverride, backendUrl, StringComparison.Ordinal))
+                throw new NotSupportedException("An active backend transaction cannot switch to a different backend URL or instance.");
+
+            leasedBackend = retainedBackend == null ? CreateBackend(op) : null;
+            var backend = retainedBackend?.Backend ?? leasedBackend!.Backend;
             using var token = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, op.CancelToken, context.TaskReader.TransferToken);
 
             try
             {
-                // Start processing the operation
-                var task = op.ExecuteAsync(backend.Backend, token.Token);
+                // Transaction-bound operations always wait for the actual result so
+                // failures remain observable and the retained instance stays serialized.
+                var waitForComplete = op.WaitForComplete || retainedBackend != null;
+                var task = op.ExecuteAsync(backend, token.Token);
 
-                if (typeof(TResult) == typeof(bool) && !op.WaitForComplete)
+                if (typeof(TResult) == typeof(bool) && !waitForComplete)
                 {
                     // Operation is accepted into queue, so we can signal completion
                     op.SetComplete((TResult)(object)true);
@@ -605,7 +808,7 @@ partial class BackendManager
                 }
                 else
                 {
-                    if (!op.WaitForComplete)
+                    if (!waitForComplete)
                         throw new NotImplementedException($"WaitForComplete is required for operations returning a value: {op.GetType().FullName}");
 
                     // Wait for the operation to complete
@@ -614,9 +817,14 @@ partial class BackendManager
             }
             catch
             {
-                // If the operation fails, we prevent reuse of the backend
-                backend.PreventReuse();
+                // A failed ordinary backend is not reusable. A transaction backend is
+                // already marked non-reusable and remains owned for rollback.
+                leasedBackend?.PreventReuse();
                 throw;
+            }
+            finally
+            {
+                leasedBackend?.Dispose();
             }
         }
 
